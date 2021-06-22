@@ -4,13 +4,16 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/nektos/act/pkg/model"
-	a "github.com/stretchr/testify/assert"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
+	assert "github.com/stretchr/testify/assert"
 )
 
 func TestRunContext_EvalBool(t *testing.T) {
@@ -138,15 +141,15 @@ func TestRunContext_EvalBool(t *testing.T) {
 	for _, table := range tables {
 		table := table
 		t.Run(table.in, func(t *testing.T) {
-			assert := a.New(t)
+			assertObject := assert.New(t)
 			defer hook.Reset()
 			b, err := rc.EvalBool(table.in)
 			if table.wantErr {
-				assert.Error(err)
+				assertObject.Error(err)
 			}
 
-			assert.Equal(table.out, b, fmt.Sprintf("Expected %s to be %v, was %v", table.in, table.out, b))
-			assert.Empty(hook.LastEntry(), table.in)
+			assertObject.Equal(table.out, b, fmt.Sprintf("Expected %s to be %v, was %v", table.in, table.out, b))
+			assertObject.Empty(hook.LastEntry(), table.in)
 		})
 	}
 }
@@ -156,15 +159,18 @@ func updateTestIfWorkflow(t *testing.T, tables []struct {
 	out     bool
 	wantErr bool
 }, rc *RunContext) {
-
 	var envs string
-	for k, v := range rc.Env {
-		envs += fmt.Sprintf(
-			`  %s: %s
-`, k, v)
+	keys := make([]string, 0, len(rc.Env))
+	for k := range rc.Env {
+		keys = append(keys, k)
 	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		envs += fmt.Sprintf("  %s: %s\n", k, rc.Env[k])
+	}
+
 	workflow := fmt.Sprintf(`
-name: "Test what expressions result in true and false on Github"
+name: "Test what expressions result in true and false on GitHub"
 on: push
 
 env:
@@ -191,18 +197,9 @@ jobs:
 			echo = `run: echo OK`
 			name = fmt.Sprintf(`"✅ I should run, expr: %s"`, expr)
 		}
-		workflow += fmt.Sprintf(`
-     - name: %s
-       id: step%d
-       if: %s
-       %s
-`, name, i, table.in, echo)
+		workflow += fmt.Sprintf("\n      - name: %s\n        id: step%d\n        if: %s\n        %s\n", name, i, table.in, echo)
 		if table.out {
-			workflow += fmt.Sprintf(`
-     - name: "Double checking expr: %s"
-       if: steps.step%d.conclusion == 'skipped'
-       run: echo "%s should have been true, but wasn't"
-`, expr, i, table.in)
+			workflow += fmt.Sprintf("\n      - name: \"Double checking expr: %s\"\n        if: steps.step%d.conclusion == 'skipped'\n        run: echo \"%s should have been true, but wasn't\"\n", expr, i, table.in)
 		}
 	}
 
@@ -215,4 +212,125 @@ jobs:
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestRunContext_GetBindsAndMounts(t *testing.T) {
+	rctemplate := &RunContext{
+		Name: "TestRCName",
+		Run: &model.Run{
+			Workflow: &model.Workflow{
+				Name: "TestWorkflowName",
+			},
+		},
+		Config: &Config{
+			BindWorkdir: false,
+		},
+	}
+
+	tests := []struct {
+		windowsPath bool
+		name        string
+		rc          *RunContext
+		wantbind    string
+		wantmount   string
+	}{
+		{false, "/mnt/linux", rctemplate, "/mnt/linux", "/mnt/linux"},
+		{false, "/mnt/path with spaces/linux", rctemplate, "/mnt/path with spaces/linux", "/mnt/path with spaces/linux"},
+		{true, "C:\\Users\\TestPath\\MyTestPath", rctemplate, "/mnt/c/Users/TestPath/MyTestPath", "/mnt/c/Users/TestPath/MyTestPath"},
+		{true, "C:\\Users\\Test Path with Spaces\\MyTestPath", rctemplate, "/mnt/c/Users/Test Path with Spaces/MyTestPath", "/mnt/c/Users/Test Path with Spaces/MyTestPath"},
+		{true, "/LinuxPathOnWindowsShouldFail", rctemplate, "", ""},
+	}
+
+	isWindows := runtime.GOOS == "windows"
+
+	for _, testcase := range tests {
+		// pin for scopelint
+		testcase := testcase
+		for _, bindWorkDir := range []bool{true, false} {
+			// pin for scopelint
+			bindWorkDir := bindWorkDir
+			testBindSuffix := ""
+			if bindWorkDir {
+				testBindSuffix = "Bind"
+			}
+
+			// Only run windows path tests on windows and non-windows on non-windows
+			if (isWindows && testcase.windowsPath) || (!isWindows && !testcase.windowsPath) {
+				t.Run((testcase.name + testBindSuffix), func(t *testing.T) {
+					config := testcase.rc.Config
+					config.Workdir = testcase.name
+					config.BindWorkdir = bindWorkDir
+					gotbind, gotmount := rctemplate.GetBindsAndMounts()
+
+					// Name binds/mounts are either/or
+					if config.BindWorkdir {
+						fullBind := testcase.name + ":" + testcase.wantbind
+						if runtime.GOOS == "darwin" {
+							fullBind += ":delegated"
+						}
+						assert.Contains(t, gotbind, fullBind)
+					} else {
+						mountkey := testcase.rc.jobContainerName()
+						assert.EqualValues(t, testcase.wantmount, gotmount[mountkey])
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestGetGitHubContext(t *testing.T) {
+	log.SetLevel(log.DebugLevel)
+
+	cwd, err := os.Getwd()
+	assert.Nil(t, err)
+
+	rc := &RunContext{
+		Config: &Config{
+			EventName: "push",
+			Workdir:   cwd,
+		},
+		Run: &model.Run{
+			Workflow: &model.Workflow{
+				Name: "GitHubContextTest",
+			},
+		},
+		Name:           "GitHubContextTest",
+		CurrentStep:    "step",
+		Matrix:         map[string]interface{}{},
+		Env:            map[string]string{},
+		ExtraPath:      []string{},
+		StepResults:    map[string]*stepResult{},
+		OutputMappings: map[MappableOutput]MappableOutput{},
+	}
+
+	ghc := rc.getGithubContext()
+
+	log.Debugf("%v", ghc)
+
+	actor := "nektos/act"
+	if a := os.Getenv("ACT_ACTOR"); a != "" {
+		actor = a
+	}
+
+	repo := "nektos/act"
+	if r := os.Getenv("ACT_REPOSITORY"); r != "" {
+		repo = r
+	}
+
+	owner := "nektos"
+	if o := os.Getenv("ACT_OWNER"); o != "" {
+		owner = o
+	}
+
+	assert.Equal(t, ghc.RunID, "1")
+	assert.Equal(t, ghc.Workspace, rc.Config.containerPath(cwd))
+	assert.Equal(t, ghc.RunNumber, "1")
+	assert.Equal(t, ghc.RetentionDays, "0")
+	assert.Equal(t, ghc.Actor, actor)
+	assert.Equal(t, ghc.Repository, repo)
+	assert.Equal(t, ghc.RepositoryOwner, owner)
+	assert.Equal(t, ghc.RunnerPerflog, "/dev/null")
+	assert.Equal(t, ghc.EventPath, ActPath+"/workflow/event.json")
+	assert.Equal(t, ghc.Token, rc.Config.Secrets["GITHUB_TOKEN"])
 }

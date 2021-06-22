@@ -54,7 +54,7 @@ func (rc *RunContext) commandHandler(ctx context.Context) common.LineHandler {
 		case "error":
 			logger.Infof("  \U00002757  %s", line)
 		case "add-mask":
-			logger.Infof("  \U00002699  %s", line)
+			logger.Infof("  \U00002699  %s", "***")
 		case "stop-commands":
 			resumeCommand = arg
 			logger.Infof("  \U00002699  %s", line)
@@ -77,8 +77,21 @@ func (rc *RunContext) setEnv(ctx context.Context, kvPairs map[string]string, arg
 	rc.Env[kvPairs["name"]] = arg
 }
 func (rc *RunContext) setOutput(ctx context.Context, kvPairs map[string]string, arg string) {
-	common.Logger(ctx).Infof("  \U00002699  ::set-output:: %s=%s", kvPairs["name"], arg)
-	rc.StepResults[rc.CurrentStep].Outputs[kvPairs["name"]] = arg
+	stepID := rc.CurrentStep
+	outputName := kvPairs["name"]
+	if outputMapping, ok := rc.OutputMappings[MappableOutput{StepID: stepID, OutputName: outputName}]; ok {
+		stepID = outputMapping.StepID
+		outputName = outputMapping.OutputName
+	}
+
+	result, ok := rc.StepResults[stepID]
+	if !ok {
+		common.Logger(ctx).Infof("  \U00002757  no outputs used step '%s'", stepID)
+		return
+	}
+
+	common.Logger(ctx).Infof("  \U00002699  ::set-output:: %s=%s", outputName, arg)
+	result.Outputs[outputName] = arg
 }
 func (rc *RunContext) addPath(ctx context.Context, arg string) {
 	common.Logger(ctx).Infof("  \U00002699  ::add-path:: %s", arg)
